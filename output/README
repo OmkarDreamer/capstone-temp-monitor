@@ -1,0 +1,15 @@
+
+
+Run the project in Ubuntu and generate the real output with:
+
+```bash
+cd ~/capstone-temp-monitor
+sudo ./app/temp_monitor --reset
+sudo ./app/temp_monitor --drift 40 | tee output/temperature_output.txt
+```
+
+Let the program run until you capture NORMAL, WARNING, and CRITICAL states,
+then press `Ctrl+C`.
+
+The resulting `temperature_output.txt` is intentionally generated from the
+actual Ubuntu VM run rather than using fabricated readings.
