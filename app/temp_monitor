@@ -1,0 +1,192 @@
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <fcntl.h>
+#include <string>
+#include <thread>
+#include <chrono>
+#include <unistd.h>
+#include <sys/ioctl.h>
+
+#include "../driver/tempsensor_ioctl.h"
+
+enum class State { NORMAL, WARNING, CRITICAL };
+
+static const char *state_name(State s)
+{
+    switch (s) {
+        case State::NORMAL:   return "NORMAL";
+        case State::WARNING:  return "WARNING";
+        case State::CRITICAL: return "CRITICAL";
+    }
+    return "UNKNOWN";
+}
+
+static State classify(double temp_c)
+{
+    if (temp_c > 80.0) return State::CRITICAL;
+    if (temp_c >= 60.0) return State::WARNING;
+    return State::NORMAL;
+}
+
+static std::string timestamp()
+{
+    std::time_t t = std::time(nullptr);
+    std::tm tm_buf{};
+    localtime_r(&t, &tm_buf);
+    char buf[32]{};
+    std::strftime(buf, sizeof(buf), "%H:%M:%S", &tm_buf);
+    return std::string(buf);
+}
+
+static int open_sensor()
+{
+    int fd = open("/dev/tempsensor", O_RDONLY);
+    if (fd < 0) {
+        std::fprintf(stderr,
+                     "[%s] open /dev/tempsensor failed: %s\n",
+                     timestamp().c_str(), std::strerror(errno));
+    }
+    return fd;
+}
+
+static bool reset_sensor()
+{
+    int fd = open_sensor();
+    if (fd < 0) return false;
+
+    bool ok = (ioctl(fd, TEMP_IOC_RESET) == 0);
+    if (!ok) {
+        std::fprintf(stderr, "[%s] ioctl RESET failed: %s\n",
+                     timestamp().c_str(), std::strerror(errno));
+    }
+    close(fd);
+    return ok;
+}
+
+static bool set_drift(int drift_tenths)
+{
+    if (drift_tenths < 0 || drift_tenths > 500) {
+        std::fprintf(stderr,
+                     "[%s] Drift must be between 0 and 500 tenths of a degree.\n",
+                     timestamp().c_str());
+        return false;
+    }
+
+    int fd = open_sensor();
+    if (fd < 0) return false;
+
+    bool ok = (ioctl(fd, TEMP_IOC_SET_DRIFT, &drift_tenths) == 0);
+    if (!ok) {
+        std::fprintf(stderr, "[%s] ioctl SET_DRIFT failed: %s\n",
+                     timestamp().c_str(), std::strerror(errno));
+    }
+    close(fd);
+    return ok;
+}
+
+static bool read_temperature(double &temp_c)
+{
+    // The driver intentionally provides one reading per open/read cycle.
+    int fd = open_sensor();
+    if (fd < 0) return false;
+
+    char buf[32]{};
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    int saved_errno = errno;
+    close(fd);
+
+    if (n <= 0) {
+        std::fprintf(stderr, "[%s] read failed: %s\n",
+                     timestamp().c_str(),
+                     n < 0 ? std::strerror(saved_errno) : "end of device data");
+        return false;
+    }
+
+    buf[n] = '\0';
+    char *end = nullptr;
+    errno = 0;
+    double value = std::strtod(buf, &end);
+    if (errno != 0 || end == buf) {
+        std::fprintf(stderr, "[%s] invalid sensor value: %s",
+                     timestamp().c_str(), buf);
+        return false;
+    }
+
+    temp_c = value;
+    return true;
+}
+
+static void print_usage(const char *program)
+{
+    std::printf(
+        "Usage:\n"
+        "  sudo %s                 Run the monitoring loop\n"
+        "  sudo %s --reset         Reset sensor to 25.0 C and exit\n"
+        "  sudo %s --drift N       Set drift to N tenths of a degree, then monitor\n"
+        "                           Example: --drift 40 = up to 4.0 C/read\n",
+        program, program, program);
+}
+
+int main(int argc, char *argv[])
+{
+    if (argc > 1) {
+        if (argc == 2 && std::strcmp(argv[1], "--reset") == 0) {
+            if (!reset_sensor()) return 1;
+            std::printf("[%s] Sensor reset to baseline (25.0 C).\n",
+                        timestamp().c_str());
+            return 0;
+        }
+
+        if (argc == 3 && std::strcmp(argv[1], "--drift") == 0) {
+            char *end = nullptr;
+            errno = 0;
+            long parsed = std::strtol(argv[2], &end, 10);
+            if (errno != 0 || end == argv[2] || *end != '\0' ||
+                parsed < 0 || parsed > 500) {
+                std::fprintf(stderr,
+                             "Invalid drift '%s'. Use an integer from 0 to 500.\n",
+                             argv[2]);
+                print_usage(argv[0]);
+                return 2;
+            }
+
+            int drift = static_cast<int>(parsed);
+            if (!set_drift(drift)) return 1;
+            std::printf("[%s] Drift set to %.1f C per reading.\n",
+                        timestamp().c_str(), drift / 10.0);
+        } else {
+            print_usage(argv[0]);
+            return 2;
+        }
+    }
+
+    std::printf("[%s] Monitoring started. Press Ctrl+C to stop.\n",
+                timestamp().c_str());
+
+    State current_state = State::NORMAL;
+    std::printf("[%s] Initial state: %s\n",
+                timestamp().c_str(), state_name(current_state));
+
+    while (true) {
+        double temp = 0.0;
+        if (read_temperature(temp)) {
+            State new_state = classify(temp);
+
+            if (new_state != current_state) {
+                std::printf("[%s] TRANSITION: %s -> %s  (temp = %.1f C)\n",
+                            timestamp().c_str(),
+                            state_name(current_state), state_name(new_state), temp);
+                current_state = new_state;
+            } else {
+                std::printf("[%s] temp = %.1f C  (state: %s)\n",
+                            timestamp().c_str(), temp, state_name(current_state));
+            }
+            std::fflush(stdout);
+        }
+
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+}
